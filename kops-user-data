@@ -1,0 +1,149 @@
+#!/bin/bash
+
+### Prerequisite 
+# Create Route53 domain for the cluster
+# Create S3 bucket to store your cluster state
+###
+
+## generate ssh-key and upload to aws IAM user
+ssh-keygen
+
+## install aws-cli
+sudo apt update 
+sudo apt install awscli -y
+aws configure
+
+## install kubctl and kops
+# install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s \
+https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# make it executable and move it to user local bin
+chmod +x ./kubectl
+sudo mv ./kubectl /usr/local/bin
+kubectl version --output=yaml
+
+# install kops
+curl -LO https://github.com/kubernetes/kops/releases/download/$(curl -s \
+https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name \
+| cut -d '"' -f 4)/kops-linux-amd64
+
+# make it executable and move it to user local bin kops
+chmod +x kops-linux-amd64
+sudo mv kops-linux-amd64 /usr/local/bin/kops
+kops version 
+
+## check if domain is resolved
+nslookup -type=ns kubevprofile.kwabenadevopsproject.com
+
+## Create cluster configuration yaml file
+export CLOUD="aws"
+export KOPS_STATE_STORE="s3://vprofile-kops-k8s-state"
+export ZONES="us-east-1a,us-east-1b,us-east-1c"
+export NODE_COUNT="3"
+export MASTER_COUNT="3"
+export NODE_SIZE="t3.small"
+export MASTER_SIZE="t3.small"
+export NODE_VOL_SIZE="8"
+export MASTER_VOL_SIZE="8"
+export DOMAIN_NAME="kubevprofile.kwabenadevopsproject.com"
+export VOL_ZONE="us-east-1a"
+
+kops create cluster $DOMAIN_NAME \
+    --cloud $CLOUD \
+    --zones $ZONES \
+    --control-plane-zones $ZONES \
+    --node-count $NODE_COUNT \
+    --master-count $MASTER_COUNT \
+    --node-size $NODE_SIZE \
+    --master-size $MASTER_SIZE \
+    --node-volume-size $NODE_VOL_SIZE \
+    --master-volume-size $MASTER_VOL_SIZE \
+    --dns-zone $DOMAIN_NAME
+    
+## Create K8s Cluster with kops
+# get the exported yaml file
+kops get all $DOMAIN_NAME -o yaml > $DOMAIN_NAME.yaml
+
+# create the Cluster
+# kops create -f $DOMAIN_NAME.yaml
+# kops create secret --name $DOMAIN_NAME sshpublickey admin -i ~/.ssh/id_rsa.pub
+kops update cluster $DOMAIN_NAME --yes --admin
+kops validate cluster $DOMAIN_NAME --wait 10m
+kops rolling-update cluster $DOMAIN_NAME --yes --cloudonly
+kubectl get nodes
+
+## Update the cluster
+kops replace -f $DOMAIN_NAME.yaml
+kops update cluster $DOMAIN_NAME --yes --admin
+kops rolling-update cluster $DOMAIN_NAME --yes --cloudonly
+
+
+### Create EBS volume for the DB pod and tag it with the same name as K8s cluster
+### note the 'volumeId'
+
+aws ec2 create-volume \
+    --availability-zone $VOL_ZONE \
+    --size 3 \
+    --volume-type gp2 \
+    --tag-specifications "ResourceType=volume,Tags=[{Key=KubernetesCluster,Value=$DOMAIN_NAME}]" \
+    > volumeInfo.txt
+
+awk '/VolumeId/ {print}' volumeInfo.txt | awk -F: '{print $2}' | sed 's|[ ","]||g' > volumeID.txt
+cat volumeID.txt
+
+### Create node labels 
+# get nodes and save node ID
+kubectl get nodes > nodes.txt
+awk '/node/ {print $1}' nodes.txt > node.txt 
+
+# describe nodes to fine which is in VOL_ZONE and label them with same name as VOL_ZONE
+# create a file label_node.sh with content below add #!/bin/bash at the top
+
+if [ -f ./node.txt ]; then
+    for node_id in $(cat node.txt)
+    do
+        zone=`kubectl describe node $node_id | grep $VOL_ZONE | awk '/ProviderID/ {print $0}' | awk -F: '{print $3}'`
+        if [ ! -z "$zone" ]
+        then
+            kubectl label nodes $node_id zone=$VOL_ZONE
+            echo $node_id >> nodeInVOL_ZONE.txt
+        else
+            echo "$node_id not in $VOL_ZONE"
+        fi
+    done
+else
+    echo "File doesn't exist!"  
+fi 
+
+
+chmod +x ./label_node.sh
+sh ./label_node.sh
+
+kubectl get nodes --show-labels
+
+### Deploying pods
+# clone repo with yaml files
+git clone git@github.com:owusukd/vprofile-project.git 
+cd vprofile-project && git checkout kod-kube-app
+cd K8s
+# apply secret
+kubectl create -f vprofileapp-secret.yaml
+kubectl get secret
+kubectl describe secret 
+
+# deploy the rest
+kubectl create -f .
+kubectl get deploy
+kubectl get pod
+
+# get load balancer endpoint and copy it
+kubectl get svc vprofileapp-service
+
+### Cleanup
+# delete the cluster
+kops delete cluster $DOMAIN_NAME --yes
+# delete volume
+vol_id=`cat volumeID.txt`
+aws delete-volume \
+    --volume-id $vol_id
