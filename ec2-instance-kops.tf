@@ -48,7 +48,7 @@ resource "aws_security_group" "kops-sg-ssh" {
     from_port = 22
     to_port = 22
     protocol = "tcp"
-    cidr_blocks = ["73.42.101.216/32"] // run the following to get your Public IP:
+    cidr_blocks = ["0.0.0.0/32"]       // run the following to get your Public IP and replace 0.0.0.0 with it:
                                        // dig -4 TXT +short o-o.myaddr.l.google.com @ns1.google.com
   }
   egress {
